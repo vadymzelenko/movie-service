@@ -24,6 +24,9 @@ export const config = {
   dataDir,
   dbPath: process.env.DB_PATH ?? path.join(dataDir, 'movie-service.db'),
   libraryPath: process.env.LIBRARY_PATH ?? path.join(dataDir, 'library.json'),
+  providersPath: process.env.PROVIDERS_PATH ?? path.join(dataDir, 'providers.json'),
+  /** Сколько ждём один провайдер, прежде чем перейти к следующему. */
+  providerTimeoutMs: Number(process.env.PROVIDER_TIMEOUT_MS ?? 8000),
   proxySecret: proxySecret(),
   /** TTL подписанных прокси-ссылок. Длинный — VOD-плейлист живёт весь сеанс просмотра. */
   proxyTtlSec: 12 * 3600,

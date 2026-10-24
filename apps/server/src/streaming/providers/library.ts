@@ -1,9 +1,9 @@
 import { readFile, stat } from 'node:fs/promises';
 import { z } from 'zod';
-import { mediaKey, mediaRefSchema, type MediaRef } from '@movie/shared';
+import { mediaKey, mediaRefSchema } from '@movie/shared';
 import { extractStreams } from '../extractor.js';
 import { fetchUpstream } from '../upstream.js';
-import type { RawSource, StreamProvider } from './types.js';
+import type { ProviderStream, ResolveParams, StreamProvider } from './types.js';
 
 const qualitySchema = z.object({ label: z.string(), height: z.number().int().optional(), url: z.url() });
 
@@ -47,41 +47,33 @@ export class LibraryProvider implements StreamProvider {
     return byKey;
   }
 
-  async resolve(media: MediaRef): Promise<RawSource[]> {
-    const entries = (await this.load()).get(mediaKey(media)) ?? [];
-    const results = await Promise.all(entries.map((e) => this.toSources(e).catch(() => [])));
+  async resolveMedia(p: ResolveParams): Promise<ProviderStream[] | null> {
+    const key = mediaKey({ kind: p.kind, id: p.tmdbId, season: p.season, episode: p.episode });
+    const entries = (await this.load()).get(key) ?? [];
+    if (!entries.length) return null;
+    const results = await Promise.all(entries.map((e) => this.toStreams(e).catch(() => [])));
     return results.flat();
   }
 
-  private async toSources(e: Entry): Promise<RawSource[]> {
+  private async toStreams(e: Entry): Promise<ProviderStream[]> {
     switch (e.type) {
       case 'hls':
-        return [{ voice: e.voice, type: 'hls', qualities: [{ label: 'Auto', url: e.url }], referer: e.referer }];
+        return [{ url: e.url, type: 'hls', label: e.voice, referer: e.referer }];
       case 'mp4':
-        return [{ voice: e.voice, type: 'mp4', qualities: e.qualities, referer: e.referer }];
+        return e.qualities.map((q) => ({ url: q.url, type: 'mp4' as const, quality: q.label, label: e.voice, referer: e.referer }));
       case 'page':
         return this.fromPage(e.url, e.voice, e.referer);
     }
   }
 
   /** Достаём потоки со страницы плеера; вложенные iframe — только с разрешённых хостов, глубина 2. */
-  private async fromPage(pageUrl: string, voice: string, referer?: string, depth = 0): Promise<RawSource[]> {
+  private async fromPage(pageUrl: string, voice: string, referer?: string, depth = 0): Promise<ProviderStream[]> {
     const res = await fetchUpstream(pageUrl, { referer, accept: 'text/html,*/*' });
     const html = await res.text();
     const { streams, iframes } = extractStreams(html, pageUrl);
-
     if (streams.length) {
-      const groups = new Map<string, RawSource>();
-      for (const s of streams) {
-        const v = s.voice ?? voice;
-        const key = `${v}|${s.type}`;
-        const g = groups.get(key) ?? { voice: v, type: s.type, qualities: [], referer: pageUrl };
-        g.qualities.push({ label: s.quality ?? (s.type === 'hls' ? 'Auto' : 'MP4'), height: s.height, url: s.url });
-        groups.set(key, g);
-      }
-      return [...groups.values()];
+      return streams.map((s) => ({ url: s.url, type: s.type, quality: s.quality, label: s.voice ?? voice, referer: pageUrl }));
     }
-
     if (depth >= 2) return [];
     const pageHost = new URL(pageUrl).host;
     const next = iframes.find((u) => {

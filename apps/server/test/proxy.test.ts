@@ -3,8 +3,9 @@ import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { after, before, describe, it } from 'node:test';
 import Fastify from 'fastify';
-import type { MediaRef, StreamSource } from '@movie/shared';
-import type { RawSource, StreamProvider } from '../src/streaming/providers/types.js';
+import type { SourcesResponse } from '@movie/shared';
+import { ProviderManager } from '../src/streaming/provider-manager.js';
+import type { ProviderStream, ResolveParams, StreamProvider } from '../src/streaming/providers/types.js';
 import { registerStreamingRoutes } from '../src/streaming/routes.js';
 import { UrlSigner } from '../src/streaming/signing.js';
 
@@ -50,12 +51,12 @@ describe('прокси: манифест → очистка → сегменты
     const provider: StreamProvider = {
       id: 'test',
       name: 'Test',
-      async resolve(media: MediaRef): Promise<RawSource[]> {
-        if (media.id !== 1) return [];
-        return [{ voice: 'Дубляж', type: 'hls', qualities: [{ label: 'Auto', url: `${origin}/master.m3u8` }], referer: 'https://player.example/' }];
+      async resolveMedia(p: ResolveParams): Promise<ProviderStream[] | null> {
+        if (p.tmdbId !== 1) return null;
+        return [{ label: 'Дубляж', type: 'hls', url: `${origin}/master.m3u8`, referer: 'https://player.example/' }];
       },
     };
-    registerStreamingRoutes(app, new UrlSigner('test', 600), [provider]);
+    registerStreamingRoutes(app, new UrlSigner('test', 600), new ProviderManager([provider]), async () => ({}));
     await app.ready();
   });
 
@@ -65,8 +66,11 @@ describe('прокси: манифест → очистка → сегменты
   });
 
   it('проходит всю цепочку и вырезает преролл', async () => {
-    const sources = (await app.inject('/api/sources?kind=movie&id=1')).json<StreamSource[]>();
+    const res = (await app.inject('/api/sources?kind=movie&id=1')).json<SourcesResponse>();
+    assert.equal(res.providerId, 'test');
+    const sources = res.sources;
     assert.equal(sources.length, 1);
+    assert.equal(sources[0]!.voice, 'Дубляж');
     const masterPath = sources[0]!.qualities[0]!.url;
     assert.ok(!masterPath.includes('127.0.0.1'), 'upstream не утекает клиенту');
 
@@ -90,7 +94,7 @@ describe('прокси: манифест → очистка → сегменты
 
   it('отвергает неподписанные ссылки', async () => {
     const forged = Buffer.from(JSON.stringify({ u: `${origin}/master.m3u8`, e: 9e9 })).toString('base64url');
-    assert.equal((await app.inject(`/proxy/hls/${forged}.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/x.m3u8`)).statusCode, 403);
+    assert.equal((await app.inject(`/proxy/hls/${forged}AAAAAAAAAAAAAAAAAAAAAAAA/x.m3u8`)).statusCode, 403);
     assert.equal((await app.inject('/api/sources?kind=tv&id=1')).statusCode, 400);
   });
 });

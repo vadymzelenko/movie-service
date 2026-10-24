@@ -1,9 +1,10 @@
 import { Readable } from 'node:stream';
 import type { FastifyInstance, FastifyReply } from 'fastify';
 import { z } from 'zod';
-import { mediaKindSchema, type MediaRef, type StreamSource } from '@movie/shared';
+import { mediaKindSchema, type SourcesResponse, type StreamSource } from '@movie/shared';
 import { cleanPlaylist, type UriKind } from './hls-cleaner.js';
-import type { StreamProvider } from './providers/types.js';
+import type { ProviderManager } from './provider-manager.js';
+import type { ProviderStream, ResolveParams } from './providers/types.js';
 import type { UrlSigner } from './signing.js';
 import { fetchUpstream, UpstreamError } from './upstream.js';
 
@@ -12,7 +13,16 @@ const sourcesQuery = z.object({
   id: z.coerce.number().int(),
   season: z.coerce.number().int().min(0).optional(),
   episode: z.coerce.number().int().min(1).optional(),
+  /** Выбранный пользователем источник («Источник 2»). */
+  provider: z.string().max(32).optional(),
+  /** Провайдеры через запятую, которые пропустить (их поток упал в плеере). */
+  exclude: z.string().max(400).optional(),
 });
+
+/** Метаданные тайтла для сопоставления у провайдеров (IMDb ID, названия, год). */
+export type DescribeTitle = (kind: ResolveParams['kind'], tmdbId: number) => Promise<Omit<ResolveParams, 'kind' | 'tmdbId' | 'season' | 'episode'>>;
+
+const heightOf = (label?: string) => Number(/(\d{3,4})p/i.exec(label ?? '')?.[1] ?? 0) || undefined;
 
 const tokenParams = z.object({ token: z.string().min(10).max(8192), name: z.string().max(200) });
 
@@ -24,45 +34,51 @@ function fileName(u: string, fallback: string): string {
 
 const PASS_HEADERS = ['content-type', 'content-length', 'content-range', 'accept-ranges', 'last-modified', 'etag'];
 
-export function registerStreamingRoutes(app: FastifyInstance, signer: UrlSigner, providers: StreamProvider[]) {
+export function registerStreamingRoutes(app: FastifyInstance, signer: UrlSigner, manager: ProviderManager, describe: DescribeTitle) {
   const playlistPath = (u: string, referer?: string) => `/proxy/hls/${signer.sign({ u, r: referer })}/${fileName(u, 'index.m3u8')}`;
   const segmentPath = (u: string, referer?: string) => `/proxy/seg/${signer.sign({ u, r: referer })}/${fileName(u, 'segment')}`;
 
-  /** Список источников (озвучка × качество) для фильма/серии. Ссылки уже указывают на наш прокси. */
-  app.get('/api/sources', async (req, reply) => {
+  /** Потоки одного провайдера → источники UI: группа = озвучка × тип, внутри — качества. */
+  const toSources = (providerId: string, providerName: string, streams: ProviderStream[]): StreamSource[] => {
+    const groups = new Map<string, StreamSource>();
+    for (const st of streams) {
+      const voice = st.label || 'Оригинал';
+      const key = `${voice}|${st.type}`;
+      let g = groups.get(key);
+      if (!g) {
+        g = { id: `${providerId}:${groups.size}`, providerId, providerName, voice, type: st.type, qualities: [] };
+        groups.set(key, g);
+      }
+      const label = st.quality || (st.type === 'hls' ? 'Авто' : 'MP4');
+      if (g.qualities.some((q) => q.label === label)) continue;
+      g.qualities.push({ label, height: heightOf(label), url: st.type === 'hls' ? playlistPath(st.url, st.referer) : segmentPath(st.url, st.referer) });
+    }
+    for (const g of groups.values()) g.qualities.sort((a, b) => (b.height ?? Infinity) - (a.height ?? Infinity));
+    return [...groups.values()];
+  };
+
+  /**
+   * Источники для фильма/серии с фоллбеком по цепочке провайдеров.
+   * Ссылки уже указывают на наш прокси; upstream-адреса и ключи клиенту не видны.
+   */
+  app.get('/api/sources', async (req, reply): Promise<SourcesResponse | undefined> => {
     const q = sourcesQuery.safeParse(req.query);
     if (!q.success) return reply.code(400).send({ error: 'invalid_query' });
-    const media: MediaRef = { kind: q.data.kind, id: q.data.id };
-    if (q.data.kind === 'tv') {
-      if (q.data.season === undefined || q.data.episode === undefined) return reply.code(400).send({ error: 'season_episode_required' });
-      media.season = q.data.season;
-      media.episode = q.data.episode;
-    }
+    const { kind, id, season, episode, provider, exclude } = q.data;
+    if (kind === 'tv' && (season === undefined || episode === undefined)) return reply.code(400).send({ error: 'season_episode_required' });
 
-    const settled = await Promise.allSettled(providers.map(async (p) => ({ p, sources: await p.resolve(media) })));
-    const result: StreamSource[] = [];
-    for (const s of settled) {
-      if (s.status === 'rejected') {
-        req.log.warn({ err: s.reason }, 'provider failed');
-        continue;
-      }
-      const { p, sources } = s.value;
-      sources.forEach((src, i) => {
-        result.push({
-          id: `${p.id}:${i}`,
-          providerId: p.id,
-          providerName: p.name,
-          voice: src.voice,
-          type: src.type,
-          qualities: src.qualities.map((q) => ({
-            label: q.label,
-            height: q.height,
-            url: src.type === 'hls' ? playlistPath(q.url, src.referer) : segmentPath(q.url, src.referer),
-          })),
-        });
-      });
-    }
-    return result;
+    const meta = await describe(kind, id).catch(() => ({}));
+    const params: ResolveParams = { ...meta, kind, tmdbId: id, ...(kind === 'tv' ? { season, episode } : {}) };
+    const result = await manager.resolveWithFallback(params, {
+      preferred: provider,
+      exclude: exclude?.split(',').filter(Boolean),
+    });
+    const active = result.providers.find((p) => p.id === result.providerId);
+    return {
+      providerId: result.providerId,
+      sources: active ? toSources(active.id, active.name, result.streams) : [],
+      providers: result.providers.map(({ id: pid, name, status }) => ({ id: pid, name, status })),
+    };
   });
 
   /** Манифест: скачиваем, вырезаем рекламу, переписываем все URI на прокси. */

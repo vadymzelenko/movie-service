@@ -1,8 +1,8 @@
-import { createHmac, timingSafeEqual } from 'node:crypto';
+import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto';
 
 /**
- * Что именно проксируем. Подписывается HMAC-ом, поэтому прокси не является
- * «открытым»: он ходит только по адресам, которые сервер сам выдал клиенту.
+ * Что именно проксируем. Токен зашифрован AES-256-GCM: клиент не может ни подделать адрес
+ * (прокси не «открытый»), ни прочитать его — в upstream-URL бывают ключи API (Jellyfin).
  */
 export interface ProxyTarget {
   /** Абсолютный upstream-URL. */
@@ -13,31 +13,35 @@ export interface ProxyTarget {
   e: number;
 }
 
-export class UrlSigner {
-  constructor(
-    private readonly secret: string,
-    private readonly ttlSec: number,
-  ) {}
+const IV_BYTES = 12;
+const TAG_BYTES = 16;
 
-  private mac(payload: string): string {
-    return createHmac('sha256', this.secret).update(payload).digest('base64url').slice(0, 32);
+export class UrlSigner {
+  private readonly key: Buffer;
+
+  constructor(
+    secret: string,
+    private readonly ttlSec: number,
+  ) {
+    this.key = createHash('sha256').update(`proxy-token:${secret}`).digest();
   }
 
   sign(target: Omit<ProxyTarget, 'e'>): string {
     const full: ProxyTarget = { ...target, e: Math.floor(Date.now() / 1000) + this.ttlSec };
-    const payload = Buffer.from(JSON.stringify(full)).toString('base64url');
-    return `${payload}.${this.mac(payload)}`;
+    const iv = randomBytes(IV_BYTES);
+    const cipher = createCipheriv('aes-256-gcm', this.key, iv);
+    const body = Buffer.concat([cipher.update(JSON.stringify(full), 'utf8'), cipher.final()]);
+    return Buffer.concat([iv, body, cipher.getAuthTag()]).toString('base64url');
   }
 
   verify(token: string): ProxyTarget | null {
-    const dot = token.lastIndexOf('.');
-    if (dot <= 0) return null;
-    const payload = token.slice(0, dot);
-    const sig = Buffer.from(token.slice(dot + 1));
-    const expected = Buffer.from(this.mac(payload));
-    if (sig.length !== expected.length || !timingSafeEqual(sig, expected)) return null;
     try {
-      const target = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8')) as ProxyTarget;
+      const raw = Buffer.from(token, 'base64url');
+      if (raw.length <= IV_BYTES + TAG_BYTES) return null;
+      const decipher = createDecipheriv('aes-256-gcm', this.key, raw.subarray(0, IV_BYTES));
+      decipher.setAuthTag(raw.subarray(raw.length - TAG_BYTES));
+      const json = Buffer.concat([decipher.update(raw.subarray(IV_BYTES, raw.length - TAG_BYTES)), decipher.final()]).toString('utf8');
+      const target = JSON.parse(json) as ProxyTarget;
       if (typeof target.u !== 'string' || typeof target.e !== 'number') return null;
       if (target.e < Date.now() / 1000) return null;
       const proto = new URL(target.u).protocol;

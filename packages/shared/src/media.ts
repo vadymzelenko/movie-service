@@ -154,8 +154,25 @@ export interface StreamSource {
   /** Озвучка / студия дубляжа. */
   voice: string;
   type: 'hls' | 'mp4';
-  /** «Auto» (master-плейлист) + отдельные качества, если провайдер их отдаёт. */
+  /** «Авто» (master-плейлист) или отдельные ссылки на каждое качество. */
   qualities: QualityOption[];
+}
+
+export type ProviderStatus = 'ok' | 'empty' | 'error' | 'timeout' | 'untried';
+
+/** Провайдер в переключателе «Источник 1 / Источник 2». */
+export interface ProviderInfo {
+  id: string;
+  name: string;
+  status: ProviderStatus;
+}
+
+export interface SourcesResponse {
+  /** Чьи потоки в `sources`; null — тайтл не нашёлся ни у одного провайдера. */
+  providerId: string | null;
+  sources: StreamSource[];
+  /** Все провайдеры в порядке приоритета. */
+  providers: ProviderInfo[];
 }
 
 // ---------------------------------------------------------------------------

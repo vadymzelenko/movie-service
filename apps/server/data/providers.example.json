@@ -1,0 +1,24 @@
+{
+  "$comment": "Скопируйте в providers.json. Порядок провайдеров = порядок фоллбека (после library.json).",
+  "includeLibrary": true,
+  "includeDemo": true,
+  "providers": [
+    {
+      "type": "jellyfin",
+      "id": "jellyfin",
+      "name": "Jellyfin",
+      "baseUrl": "http://192.168.1.10:8096",
+      "apiKey": "0123456789abcdef0123456789abcdef",
+      "directPlay": true
+    },
+    {
+      "type": "http",
+      "id": "home-api",
+      "name": "Домашний сервер",
+      "endpointUrl": "http://nas.local:8080/api/streams?tmdb={tmdbId}&imdb={imdbId}&season={season}&episode={episode}",
+      "headers": { "authorization": "Bearer my-token" },
+      "itemsPath": "data.streams",
+      "fields": { "url": "src", "label": "audio" }
+    }
+  ]
+}

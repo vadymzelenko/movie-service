@@ -1,22 +1,17 @@
-import type { MediaRef } from '@movie/shared';
 import { DEMO_SERIES_ID } from '../../metadata/demo.js';
-import type { RawSource, StreamProvider } from './types.js';
+import type { ProviderStream, ResolveParams, StreamProvider } from './types.js';
 
 /** Публичные тестовые HLS-потоки открытых фильмов Blender Foundation. */
-const STREAMS: Record<number, RawSource[]> = {
+const STREAMS: Record<number, ProviderStream[]> = {
   10378: [
-    { voice: 'Оригинал', type: 'hls', qualities: [{ label: 'Auto', url: 'https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8' }] },
+    { label: 'Оригинал', type: 'hls', url: 'https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8' },
   ],
   45745: [
     // Мультиязычный поток: озвучки придут как HLS audio tracks.
-    { voice: 'Оригинал', type: 'hls', qualities: [{ label: 'Auto', url: 'https://bitdash-a.akamaihd.net/content/sintel/hls/playlist.m3u8' }] },
+    { label: 'Оригинал', type: 'hls', url: 'https://bitdash-a.akamaihd.net/content/sintel/hls/playlist.m3u8' },
   ],
   133701: [
-    {
-      voice: 'Оригинал',
-      type: 'hls',
-      qualities: [{ label: 'Auto', url: 'https://demo.unified-streaming.com/k8s/features/stable/video/tears-of-steel/tears-of-steel.ism/.m3u8' }],
-    },
+    { label: 'Оригинал', type: 'hls', url: 'https://demo.unified-streaming.com/k8s/features/stable/video/tears-of-steel/tears-of-steel.ism/.m3u8' },
   ],
 };
 
@@ -24,14 +19,14 @@ const EPISODES = [10378, 45745, 133701];
 
 export class DemoProvider implements StreamProvider {
   readonly id = 'demo';
-  readonly name = 'Открытые фильмы';
+  readonly name = 'Демо (открытые фильмы)';
 
-  async resolve(media: MediaRef): Promise<RawSource[]> {
-    if (media.kind === 'movie') return STREAMS[media.id] ?? [];
-    if (media.id === DEMO_SERIES_ID && media.season === 1 && media.episode) {
-      const movieId = EPISODES[media.episode - 1];
-      return movieId ? (STREAMS[movieId] ?? []) : [];
+  async resolveMedia(p: ResolveParams): Promise<ProviderStream[] | null> {
+    if (p.kind === 'movie') return STREAMS[p.tmdbId] ?? null;
+    if (p.tmdbId === DEMO_SERIES_ID && p.season === 1 && p.episode) {
+      const movieId = EPISODES[p.episode - 1];
+      return movieId ? (STREAMS[movieId] ?? null) : null;
     }
-    return [];
+    return null;
   }
 }

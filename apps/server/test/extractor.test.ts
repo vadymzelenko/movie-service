@@ -47,18 +47,21 @@ describe('extractStreams', () => {
 describe('UrlSigner', () => {
   const s = new UrlSigner('secret', 60);
 
-  it('подписывает и проверяет', () => {
-    const t = s.sign({ u: 'https://cdn.example.com/a.m3u8', r: 'https://player.example.com/' });
-    assert.equal(s.verify(t)?.u, 'https://cdn.example.com/a.m3u8');
+  it('шифрует и расшифровывает', () => {
+    const t = s.sign({ u: 'https://cdn.example.com/a.m3u8?api_key=SECRET', r: 'https://player.example.com/' });
+    assert.equal(s.verify(t)?.u, 'https://cdn.example.com/a.m3u8?api_key=SECRET');
+    assert.ok(!Buffer.from(t, 'base64url').toString('latin1').includes('SECRET'), 'ключ не читается из токена');
   });
 
-  it('отвергает подделку и чужой секрет', () => {
+  it('отвергает подделку, порчу и чужой секрет', () => {
     const t = s.sign({ u: 'https://cdn.example.com/a.m3u8' });
-    const [payload] = t.split('.');
     const forged = Buffer.from(JSON.stringify({ u: 'http://169.254.169.254/', e: 9e9 })).toString('base64url');
-    assert.equal(s.verify(`${forged}.${t.split('.')[1]}`), null);
+    assert.equal(s.verify(forged), null);
+    const raw = Buffer.from(t, 'base64url');
+    raw[raw.length - 20] ^= 1;
+    assert.equal(s.verify(raw.toString('base64url')), null);
     assert.equal(new UrlSigner('other', 60).verify(t), null);
-    assert.equal(s.verify(`${payload}`), null);
+    assert.equal(s.verify('x'), null);
   });
 
   it('отвергает просроченные и не-http ссылки', () => {
