@@ -8,3 +8,4 @@ out/
 apps/server/data/*.db
 apps/server/data/*.db-*
 next-env.d.ts
+apps/server/data/library.json

@@ -1,0 +1,49 @@
+@import 'tailwindcss';
+
+@theme {
+  --color-bg: #09090b;
+  --color-surface: #18181b;
+  --color-surface-2: #27272a;
+  --color-muted: #a1a1aa;
+  --color-accent: #e50914;
+  --color-accent-soft: #f43f5e;
+  --color-kp: #ff6a00;
+  --color-imdb: #f5c518;
+  --font-sans: 'Inter', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  --ease-tv: cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+html,
+body {
+  background: var(--color-bg);
+  color: #fafafa;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Горизонтальные ряды без видимого скроллбара. */
+.no-scrollbar {
+  scrollbar-width: none;
+}
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+
+/* На TV системный outline заменён собственной подсветкой фокуса. */
+.tv-root *:focus {
+  outline: none;
+}
+.tv-root {
+  cursor: none;
+  user-select: none;
+}
+
+/* Кольцо фокуса 10-foot UI: заметно с 3 метров, но без «кислотности». */
+.focus-glow {
+  box-shadow:
+    0 0 0 0.25rem #fff,
+    0 0 2.5rem 0.25rem rgb(255 255 255 / 0.35);
+}
+
+input[type='range'].remote-range {
+  accent-color: var(--color-accent);
+}
