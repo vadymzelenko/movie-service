@@ -76,3 +76,11 @@ apps/web            Next.js (App Router)
 npm test          # тесты сервера
 npm run typecheck # все пакеты
 ```
+
+## Деплой фронтенда на Vercel
+
+В настройках проекта Vercel укажите **Root Directory → `apps/web`** (остальное возьмётся из `apps/web/vercel.json`).
+Vercel поднимет только Next.js-часть (`/tv`, `/remote`). Сервер (`apps/server`) там работать не может:
+serverless-функции не держат постоянные WebSocket-соединения и не сохраняют SQLite между вызовами.
+Запустите сервер дома (мини-ПК, NAS) или на VPS за HTTPS и укажите его адрес в переменной
+`NEXT_PUBLIC_API_URL` в Vercel. Адрес обязательно `https://`: страница на HTTPS не сможет обращаться к `http://`-серверу (mixed content).
