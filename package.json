@@ -1,0 +1,24 @@
+{
+  "name": "movie-service",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Домашний веб-кинотеатр для Smart TV с управлением со смартфона",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "dev": "npm run build -w @movie/shared && concurrently -n server,web -c cyan,magenta \"npm run dev -w @movie/server\" \"npm run dev -w @movie/web\"",
+    "build": "npm run build -w @movie/shared && npm run build -w @movie/server && npm run build -w @movie/web",
+    "start": "concurrently -n server,web \"npm run start -w @movie/server\" \"npm run start -w @movie/web\"",
+    "typecheck": "npm run build -w @movie/shared && npm run typecheck --workspaces --if-present",
+    "test": "npm run build -w @movie/shared && npm run test -w @movie/server"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1",
+    "typescript": "^5.9.3"
+  },
+  "engines": {
+    "node": ">=22.13"
+  }
+}

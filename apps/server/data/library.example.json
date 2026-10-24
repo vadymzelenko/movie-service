@@ -1,0 +1,27 @@
+{
+  "$comment": "Скопируйте в library.json. Ваша собственная медиатека: NAS, Jellyfin/Plex direct-play, легально купленные/лицензированные потоки.",
+  "entries": [
+    {
+      "media": { "kind": "movie", "id": 10378 },
+      "voice": "Оригинал (EN)",
+      "type": "hls",
+      "url": "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8"
+    },
+    {
+      "media": { "kind": "tv", "id": 1399, "season": 1, "episode": 1 },
+      "voice": "Дубляж",
+      "type": "mp4",
+      "qualities": [
+        { "label": "1080p", "height": 1080, "url": "http://192.168.1.10:8096/media/got/s01e01-1080.mp4" },
+        { "label": "720p", "height": 720, "url": "http://192.168.1.10:8096/media/got/s01e01-720.mp4" }
+      ]
+    },
+    {
+      "media": { "kind": "movie", "id": 45745 },
+      "voice": "Плеер со страницы (экстрактор)",
+      "type": "page",
+      "url": "https://player.example.com/embed/45745",
+      "referer": "https://player.example.com/"
+    }
+  ]
+}
