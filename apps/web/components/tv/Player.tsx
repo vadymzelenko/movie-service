@@ -2,15 +2,17 @@
 
 import Hls, { type Level, type MediaPlaylist } from 'hls.js';
 import { AnimatePresence, motion } from 'framer-motion';
-import { Languages, Loader2, Pause, Play, RotateCcw, RotateCw, Settings2, SkipForward } from 'lucide-react';
+import { Languages, Loader2, Pause, Play, RotateCcw, RotateCw, Server, Settings2, SkipForward } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { formatTime, type MediaRef, type PlayerControl, type PlayerState, type StreamSource } from '@movie/shared';
-import { api } from '@/lib/api';
+import { formatTime, type MediaRef, type PlayerControl, type PlayerState, type ProviderInfo, type StreamSource } from '@movie/shared';
+import { usePlaybackSync } from '@/hooks/usePlaybackSync';
 import { apiUrl } from '@/lib/config';
 import { playerBus } from '@/lib/player-bus';
 import { FocusSection, useBackHandler, useFocusable, useKeyHandler, useSpatialEngine } from '@/lib/spatial/SpatialNavigation';
 import { cn } from '@/lib/cn';
+import { AutoNextOverlay, type NextEpisodeInfo } from './AutoNextOverlay';
 import { FocusButton } from './FocusButton';
+import { VolumeHUD } from './VolumeHUD';
 
 export interface PlayerProps {
   media: MediaRef;
@@ -22,12 +24,21 @@ export interface PlayerProps {
   qualityLabel: string;
   startAt: number;
   onClose: () => void;
+  /** Следующая серия: кнопка в панели + оверлей автоперехода после `ended`. */
+  next?: NextEpisodeInfo;
   onNext?: () => void;
   onState?: (state: PlayerState) => void;
+  /** Цепочка провайдеров для переключателя «Источник». */
+  providers?: ProviderInfo[];
+  providerId?: string | null;
+  onSwitchProvider?: (providerId: string, position: number) => void;
+  /** Поток не играет даже после попыток восстановления — родитель переключит на резервный источник. */
+  onSourceFailed?: (position: number) => void;
 }
 
 const HIDE_CONTROLS_MS = 4000;
-const SAVE_EVERY_MS = 10_000;
+const HUD_HIDE_MS = 2000;
+const VOLUME_STEP = 0.05;
 const PROGRESS_ID = 'player:progress';
 
 const heightFromLabel = (label: string) => Number(/(\d{3,4})/.exec(label)?.[1] ?? 0) || undefined;
@@ -37,7 +48,16 @@ interface MenuItem {
   label: string;
   selected: boolean;
   onSelect: () => void;
+  hint?: string;
 }
+
+const PROVIDER_HINT: Record<ProviderInfo['status'], string | undefined> = {
+  ok: undefined,
+  untried: undefined,
+  empty: 'нет этого тайтла',
+  error: 'недоступен',
+  timeout: 'не отвечает',
+};
 
 function ProgressBar({ current, duration, buffered, preview }: { current: number; duration: number; buffered: number; preview: number | null }) {
   const { ref, focused } = useFocusable<HTMLDivElement>({ id: PROGRESS_ID });
@@ -87,6 +107,7 @@ function Menu({ title, items, onClose }: { title: string; items: MenuItem[]; onC
             >
               {it.selected ? '● ' : ''}
               {it.label}
+              {it.hint && <span className="ml-auto pl-4 text-[1.15rem] font-normal text-white/45">{it.hint}</span>}
             </FocusButton>
           ))}
         </div>
@@ -95,15 +116,39 @@ function Menu({ title, items, onClose }: { title: string; items: MenuItem[]; onC
   );
 }
 
-export function Player({ media, title, subtitle, sources, sourceId, qualityLabel, startAt, onClose, onNext, onState }: PlayerProps) {
+export function Player({
+  media,
+  title,
+  subtitle,
+  sources,
+  sourceId,
+  qualityLabel,
+  startAt,
+  onClose,
+  next,
+  onNext,
+  onState,
+  providers = [],
+  providerId,
+  onSwitchProvider,
+  onSourceFailed,
+}: PlayerProps) {
   const engine = useSpatialEngine();
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  // Элемент в state — для usePlaybackSync (подписки на события <video>).
+  const [videoEl, setVideoEl] = useState<HTMLVideoElement | null>(null);
+  const attachVideo = useCallback((el: HTMLVideoElement | null) => {
+    videoRef.current = el;
+    setVideoEl(el);
+  }, []);
   const hlsRef = useRef<Hls | null>(null);
 
   const [activeSourceId, setActiveSourceId] = useState(sourceId);
   const [activeQuality, setActiveQuality] = useState(qualityLabel);
   const source = sources.find((s) => s.id === activeSourceId) ?? sources[0];
   const quality = source?.qualities.find((q) => q.label === activeQuality) ?? source?.qualities[0];
+  /** Качества — отдельные ссылки (MP4, Jellyfin-профили), а не уровни внутри одного master-плейлиста. */
+  const urlQualities = source?.type === 'mp4' || (source?.qualities.length ?? 0) > 1;
 
   const [paused, setPaused] = useState(true);
   const [buffering, setBuffering] = useState(true);
@@ -121,7 +166,11 @@ export function Player({ media, title, subtitle, sources, sourceId, qualityLabel
   const [audioTrack, setAudioTrack] = useState(-1);
 
   const [controls, setControls] = useState(true);
-  const [menu, setMenu] = useState<'voice' | 'quality' | null>(null);
+  const [menu, setMenu] = useState<'voice' | 'quality' | 'provider' | null>(null);
+  const [hud, setHud] = useState(false);
+  const hudTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const [autoNext, setAutoNext] = useState(false);
+  const autoNextShown = useRef(false);
   const menuOpen = useRef(false);
   menuOpen.current = menu !== null;
   const [seekPreview, setSeekPreview] = useState<number | null>(null);
@@ -130,6 +179,9 @@ export function Player({ media, title, subtitle, sources, sourceId, qualityLabel
   const resumeAt = useRef(startAt);
 
   // ---- Видео-движок ---------------------------------------------------------
+
+  const onSourceFailedRef = useRef(onSourceFailed);
+  onSourceFailedRef.current = onSourceFailed;
 
   useEffect(() => {
     const video = videoRef.current;
@@ -146,6 +198,15 @@ export function Player({ media, title, subtitle, sources, sourceId, qualityLabel
       void video.play().catch(() => setPaused(true));
     };
 
+    const failSource = () => {
+      if (onSourceFailedRef.current) {
+        setError('Источник не отвечает — переключаемся на резервный…');
+        onSourceFailedRef.current(video.currentTime || resumeAt.current);
+      } else setError('Не удалось воспроизвести поток. Попробуйте другую озвучку или качество.');
+    };
+    const onVideoError = () => failSource();
+    video.addEventListener('error', onVideoError);
+
     if (source.type === 'hls' && Hls.isSupported()) {
       const hls = new Hls({
         enableWorker: true,
@@ -159,7 +220,7 @@ export function Player({ media, title, subtitle, sources, sourceId, qualityLabel
       hlsRef.current = hls;
       hls.on(Hls.Events.MANIFEST_PARSED, (_e, data) => {
         setLevels(data.levels);
-        const cap = heightFromLabel(qualityLabel);
+        const cap = urlQualities ? undefined : heightFromLabel(qualityLabel);
         if (cap) {
           // «Не выше выбранного качества»: ABR работает только в этом диапазоне.
           const allowed = data.levels.map((l, i) => ({ h: l.height, i })).filter((l) => l.h <= cap);
@@ -174,15 +235,19 @@ export function Player({ media, title, subtitle, sources, sourceId, qualityLabel
       });
       hls.on(Hls.Events.AUDIO_TRACK_SWITCHED, (_e, data) => setAudioTrack(data.id));
       let mediaRecoveries = 0;
+      let networkRetries = 0;
       hls.on(Hls.Events.ERROR, (_e, data) => {
         if (!data.fatal) return;
-        if (data.type === Hls.ErrorTypes.NETWORK_ERROR) hls.startLoad();
+        // Манифест не загрузился/битый — источник мёртв, повторять бессмысленно.
+        const manifestDead = data.details === Hls.ErrorDetails.MANIFEST_LOAD_ERROR || data.details === Hls.ErrorDetails.MANIFEST_PARSING_ERROR;
+        if (data.type === Hls.ErrorTypes.NETWORK_ERROR && !manifestDead && networkRetries++ < 3) hls.startLoad();
         else if (data.type === Hls.ErrorTypes.MEDIA_ERROR && mediaRecoveries++ < 2) hls.recoverMediaError();
-        else setError('Не удалось воспроизвести поток. Попробуйте другую озвучку или качество.');
+        else failSource();
       });
       hls.loadSource(url);
       hls.attachMedia(video);
       return () => {
+        video.removeEventListener('error', onVideoError);
         hls.destroy();
         hlsRef.current = null;
       };
@@ -192,11 +257,12 @@ export function Player({ media, title, subtitle, sources, sourceId, qualityLabel
     video.src = url;
     video.addEventListener('loadedmetadata', seekToResume, { once: true });
     return () => {
+      video.removeEventListener('error', onVideoError);
       video.removeEventListener('loadedmetadata', seekToResume);
       video.removeAttribute('src');
       video.load();
     };
-  }, [source, quality, qualityLabel]);
+  }, [source, quality, qualityLabel, urlQualities]);
 
   useEffect(() => {
     const v = videoRef.current;
@@ -222,42 +288,17 @@ export function Player({ media, title, subtitle, sources, sourceId, qualityLabel
     };
   }, []);
 
-  // ---- Сохранение таймкода --------------------------------------------------
+  // ---- Сохранение таймкода: localStorage каждые 5 с + сервер (см. usePlaybackSync) ----
 
+  const { flush } = usePlaybackSync(videoEl, media);
+
+  // Конец серии → оверлей автоперехода (один раз на серию).
   useEffect(() => {
-    // Элемент захватываем в замыкание: при размонтировании videoRef.current уже null.
-    const v = videoRef.current;
-    if (!v) return;
-    const snapshot = () =>
-      Number.isFinite(v.duration) && v.duration > 0 ? { position: v.ended ? v.duration : v.currentTime, duration: v.duration } : null;
-    const save = () => {
-      const s = snapshot();
-      if (s && s.position > 0) void api.saveProgress(media, s).catch(() => {});
-    };
-    const timer = setInterval(() => {
-      if (!v.paused) save();
-    }, SAVE_EVERY_MS);
-    const onHide = () => {
-      const s = snapshot();
-      if (document.visibilityState === 'hidden' && s) api.beaconProgress(media, s);
-    };
-    v.addEventListener('pause', save);
-    v.addEventListener('ended', save);
-    v.addEventListener('seeked', save);
-    document.addEventListener('visibilitychange', onHide);
-    window.addEventListener('pagehide', onHide);
-    return () => {
-      clearInterval(timer);
-      v.removeEventListener('pause', save);
-      v.removeEventListener('ended', save);
-      v.removeEventListener('seeked', save);
-      document.removeEventListener('visibilitychange', onHide);
-      window.removeEventListener('pagehide', onHide);
-      // Выход из плеера — финальная запись (beacon переживёт и закрытие вкладки).
-      const s = snapshot();
-      if (s && s.position > 0) api.beaconProgress(media, s);
-    };
-  }, [media]);
+    if (ended && next && onNext && !autoNextShown.current) {
+      autoNextShown.current = true;
+      setAutoNext(true);
+    }
+  }, [ended, next, onNext]);
 
   // ---- Публикация состояния для пульта ---------------------------------------
 
@@ -327,16 +368,39 @@ export function Player({ media, title, subtitle, sources, sourceId, qualityLabel
   );
 
   const exit = useCallback(async () => {
-    const v = videoRef.current;
-    v?.pause();
+    videoRef.current?.pause();
     // Дожидаемся записи таймкода, чтобы карточка сразу показала «Смотреть с MM:SS».
-    if (v && Number.isFinite(v.duration) && v.duration > 0 && v.currentTime > 0) {
-      await api.saveProgress(media, { position: v.ended ? v.duration : v.currentTime, duration: v.duration }).catch(() => {});
-    }
+    await flush();
     onClose();
-  }, [media, onClose]);
+  }, [flush, onClose]);
+
+  const showHud = useCallback(() => {
+    setHud(true);
+    clearTimeout(hudTimer.current);
+    hudTimer.current = setTimeout(() => setHud(false), HUD_HIDE_MS);
+  }, []);
+  useEffect(() => () => clearTimeout(hudTimer.current), []);
+
+  const changeVolume = useCallback(
+    (delta: number) => {
+      const v = videoRef.current;
+      if (!v) return;
+      const base = v.muted ? 0 : v.volume;
+      v.volume = Math.round(Math.max(0, Math.min(1, base + delta)) * 100) / 100;
+      v.muted = v.volume === 0;
+      showHud();
+    },
+    [showHud],
+  );
 
   useKeyHandler((key) => {
+    // Оверлей автоперехода: Back/Play — его обработчики, стрелки/Enter — навигация по его кнопкам.
+    if (autoNext) return false;
+    // Панель скрыта: ↑/↓ — громкость с HUD, панель не показываем.
+    if (!controls && !menu && (key === 'up' || key === 'down')) {
+      changeVolume(key === 'up' ? VOLUME_STEP : -VOLUME_STEP);
+      return true;
+    }
     showControls();
     if (key === 'play_pause') return toggle(), true;
     if (key === 'back') {
@@ -349,10 +413,6 @@ export function Player({ media, title, subtitle, sources, sourceId, qualityLabel
       // OSD скрыт: стрелки — перемотка, Enter — пауза, вверх/вниз — показать панель.
       if (key === 'left' || key === 'right') return nudge(key === 'right' ? 1 : -1), true;
       if (key === 'enter') return toggle(), true;
-      if (key === 'up' || key === 'down') {
-        requestAnimationFrame(() => engine.focus('player:toggle'));
-        return true;
-      }
     }
     if (engine.getFocusedId() === PROGRESS_ID) {
       if (key === 'left' || key === 'right') return nudge(key === 'right' ? 1 : -1), true;
@@ -384,12 +444,13 @@ export function Player({ media, title, subtitle, sources, sourceId, qualityLabel
           case 'volume':
             v.volume = cmd.value;
             if (cmd.value > 0) v.muted = false;
-            return;
+            return showHud();
           case 'mute':
             v.muted = cmd.muted;
+            return showHud();
         }
       }),
-    [showControls, toggle, exit, seekTo],
+    [showControls, showHud, toggle, exit, seekTo],
   );
 
   // ---- Меню озвучки/качества -------------------------------------------------
@@ -421,7 +482,7 @@ export function Player({ media, title, subtitle, sources, sourceId, qualityLabel
   }, [sources, activeSourceId, audioTracks, audioTrack]);
 
   const qualityItems: MenuItem[] = useMemo(() => {
-    if (source?.type === 'mp4') {
+    if (source && urlQualities) {
       return source.qualities.map((q) => ({
         key: q.label,
         label: q.label,
@@ -457,15 +518,24 @@ export function Player({ media, title, subtitle, sources, sourceId, qualityLabel
         },
       })),
     ];
-  }, [source, activeQuality, levels, level]);
+  }, [source, urlQualities, activeQuality, levels, level]);
+
+  const providerItems: MenuItem[] = providers.map((p, i) => ({
+    key: p.id,
+    label: `Источник ${i + 1} · ${p.name}`,
+    selected: p.id === providerId,
+    hint: PROVIDER_HINT[p.status],
+    onSelect: () => onSwitchProvider?.(p.id, videoRef.current?.currentTime ?? 0),
+  }));
+  const providerIndex = providers.findIndex((p) => p.id === providerId);
 
   const currentQualityLabel =
-    source?.type === 'mp4' ? activeQuality : level === -1 ? 'Авто' : levels[level]?.height ? `${levels[level]!.height}p` : 'Авто';
+    urlQualities ? (quality?.label ?? activeQuality) : level === -1 ? 'Авто' : levels[level]?.height ? `${levels[level]!.height}p` : 'Авто';
   const currentVoice = voiceItems.find((v) => v.selected)?.label ?? source?.voice;
 
   return (
     <FocusSection id="player" trap autoFocus={false} className="fixed inset-0 z-50 bg-black">
-      <video ref={videoRef} className="absolute inset-0 size-full bg-black object-contain" playsInline />
+      <video ref={attachVideo} className="absolute inset-0 size-full bg-black object-contain" playsInline />
 
       {(buffering || error) && (
         <div className="absolute inset-0 flex items-center justify-center">
@@ -513,6 +583,11 @@ export function Player({ media, title, subtitle, sources, sourceId, qualityLabel
                     <SkipForward className="size-[2rem]" /> Следующая серия
                   </FocusButton>
                 )}
+                {providers.length > 1 && onSwitchProvider && (
+                  <FocusButton id="player:provider" onEnter={() => setMenu('provider')}>
+                    <Server className="size-[2rem]" /> Источник {providerIndex + 1}
+                  </FocusButton>
+                )}
                 {voiceItems.length > 1 && (
                   <FocusButton id="player:voice" onEnter={() => setMenu('voice')}>
                     <Languages className="size-[2rem]" /> {currentVoice}
@@ -530,6 +605,27 @@ export function Player({ media, title, subtitle, sources, sourceId, qualityLabel
       <AnimatePresence>
         {menu === 'voice' && <Menu key="voice" title="Озвучка" items={voiceItems} onClose={() => setMenu(null)} />}
         {menu === 'quality' && <Menu key="quality" title="Качество" items={qualityItems} onClose={() => setMenu(null)} />}
+        {menu === 'provider' && <Menu key="provider" title="Источник" items={providerItems} onClose={() => setMenu(null)} />}
+      </AnimatePresence>
+
+      <VolumeHUD visible={hud} volume={volume} muted={muted} />
+
+      <AnimatePresence>
+        {autoNext && next && onNext && (
+          <AutoNextOverlay
+            key="autonext"
+            next={next}
+            onPlay={() => {
+              setAutoNext(false);
+              onNext();
+            }}
+            onCancel={() => {
+              setAutoNext(false);
+              setControls(true);
+              requestAnimationFrame(() => engine.focus('player:next'));
+            }}
+          />
+        )}
       </AnimatePresence>
     </FocusSection>
   );

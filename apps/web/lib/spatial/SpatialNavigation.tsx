@@ -27,6 +27,7 @@ const KEY_CODES: Record<number, NavKey> = {
   39: 'right',
   40: 'down',
   13: 'enter',
+  32: 'play_pause', // Space
   27: 'back',
   461: 'back', // LG webOS
   10009: 'back', // Samsung Tizen

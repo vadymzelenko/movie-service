@@ -11,7 +11,7 @@ import {
   type ProgressEntry,
   type ProgressUpdate,
   type Review,
-  type StreamSource,
+  type SourcesResponse,
   type TitleDetails,
   type TitleSummary,
 } from '@movie/shared';
@@ -36,8 +36,11 @@ export const api = {
   title: (kind: MediaKind, id: number) => request<TitleDetails>(`/api/title/${kind}/${id}`),
   reviews: (kind: MediaKind, id: number) => request<Review[]>(`/api/title/${kind}/${id}/reviews`),
   episodes: (id: number, season: number) => request<Episode[]>(`/api/tv/${id}/season/${season}`),
-  sources: (ref: MediaRef) =>
-    request<StreamSource[]>(`/api/sources?${qs({ kind: ref.kind, id: ref.id, season: ref.season, episode: ref.episode })}`),
+  /** Источники с фоллбеком по цепочке провайдеров; `provider` — выбранный вручную, `exclude` — упавшие. */
+  sources: (ref: MediaRef, opts: { provider?: string; exclude?: string[] } = {}) =>
+    request<SourcesResponse>(
+      `/api/sources?${qs({ kind: ref.kind, id: ref.id, season: ref.season, episode: ref.episode, provider: opts.provider, exclude: opts.exclude?.join(',') || undefined })}`,
+    ),
 
   progress: () => request<ProgressEntry[]>('/api/progress'),
   titleProgress: (kind: MediaKind, id: number) => request<ProgressEntry[]>(`/api/progress/title/${kind}/${id}`),

@@ -12,12 +12,14 @@ import {
   type MediaRef,
   type PlayerState,
   type ProgressEntry,
+  type ProviderInfo,
   type Review,
   type StreamSource,
   type TitleDetails,
 } from '@movie/shared';
 import { api } from '@/lib/api';
 import { useLibrary } from '@/lib/library-store';
+import { resumePosition } from '@/lib/playback-store';
 import { FocusSection, useBackHandler, useFocusable, useKeyHandler } from '@/lib/spatial/SpatialNavigation';
 import { cn } from '@/lib/cn';
 import { FocusButton } from './FocusButton';
@@ -44,6 +46,10 @@ interface TitleModalProps {
 interface Playing {
   media: MediaRef;
   sources: StreamSource[];
+  providers: ProviderInfo[];
+  providerId: string | null;
+  /** Провайдеры, чьи потоки уже упали в этом сеансе — фоллбек их пропускает. */
+  failed: string[];
   sourceId: string;
   qualityLabel: string;
   startAt: number;
@@ -196,6 +202,9 @@ export function TitleModal({ request, onClose, onPlayerState }: TitleModalProps)
   const [episodes, setEpisodes] = useState<Episode[]>([]);
   const [episode, setEpisode] = useState<number | null>(null);
   const [sources, setSources] = useState<StreamSource[] | null>(null);
+  const [providers, setProviders] = useState<ProviderInfo[]>([]);
+  const [providerId, setProviderId] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const [sourceId, setSourceId] = useState<string | null>(null);
   const [quality, setQuality] = useState<string>(() => readPref(QUALITY_PREF_KEY) ?? 'Авто');
   const [playing, setPlaying] = useState<Playing | null>(null);
@@ -254,28 +263,35 @@ export function TitleModal({ request, onClose, onPlayerState }: TitleModalProps)
     return (list.find((s) => s.voice === pref) ?? list[0])?.id ?? null;
   }, []);
 
+  const [preferredProvider, setPreferredProvider] = useState<string | undefined>();
+
   useEffect(() => {
     if (!currentRef) return;
     let cancelled = false;
     setSources(null);
     void api
-      .sources(currentRef)
-      .then((list) => {
+      .sources(currentRef, { provider: preferredProvider })
+      .then((res) => {
         if (cancelled) return;
-        setSources(list);
-        setSourceId(pickSource(list));
+        setSources(res.sources);
+        setProviders(res.providers);
+        setProviderId(res.providerId);
+        setSourceId(pickSource(res.sources));
+        if (preferredProvider && res.providerId !== preferredProvider) setNotice('В выбранном источнике этого нет — показан следующий доступный');
       })
       .catch(() => !cancelled && setSources([]));
     return () => {
       cancelled = true;
     };
-  }, [currentRef, pickSource]);
+  }, [currentRef, pickSource, preferredProvider]);
 
   const progressByKey = useMemo(() => new Map((titleProgress ?? []).map((p) => [p.mediaKey, p])), [titleProgress]);
   const current = currentRef ? progressByKey.get(mediaKey(currentRef)) : undefined;
-  const resumable = current && !current.watched && current.position > 30 ? current.position : 0;
+  const resumable = currentRef ? resumePosition(mediaKey(currentRef), current) : 0;
   const source = sources?.find((s) => s.id === sourceId);
-  const qualityOptions = source?.type === 'mp4' ? source.qualities.map((q) => q.label) : HLS_QUALITY_CAPS;
+  // Отдельные ссылки на качества (MP4, профили Jellyfin) или потолок ABR для одного master-плейлиста.
+  const urlQualities = (s?: StreamSource) => !!s && (s.type === 'mp4' || s.qualities.length > 1);
+  const qualityOptions = source && urlQualities(source) ? source.qualities.map((q) => q.label) : HLS_QUALITY_CAPS;
   const effectiveQuality = qualityOptions.includes(quality) ? quality : (qualityOptions[0] ?? 'Авто');
 
   // ---- Воспроизведение ----------------------------------------------------------
@@ -285,16 +301,63 @@ export function TitleModal({ request, onClose, onPlayerState }: TitleModalProps)
     ref.kind === 'tv' ? `Сезон ${ref.season}, серия ${ref.episode}${episodeName(ref.season!, ref.episode!) ? ` · ${episodeName(ref.season!, ref.episode!)}` : ''}` : undefined;
 
   const play = useCallback(
-    (ref: MediaRef, list: StreamSource[], opts: { startAt?: number; sourceId?: string | null } = {}) => {
-      const sid = opts.sourceId ?? pickSource(list);
+    (
+      ref: MediaRef,
+      res: { sources: StreamSource[]; providers: ProviderInfo[]; providerId: string | null },
+      opts: { startAt?: number; sourceId?: string | null; failed?: string[] } = {},
+    ) => {
+      const list = res.sources;
+      const sid = opts.sourceId && list.some((s) => s.id === opts.sourceId) ? opts.sourceId : pickSource(list);
       const src = list.find((s) => s.id === sid);
       if (!src) return;
-      const saved = progressByKey.get(mediaKey(ref));
-      const startAt = opts.startAt ?? (saved && !saved.watched && saved.position > 30 ? saved.position : 0);
-      setPlaying({ media: ref, sources: list, sourceId: src.id, qualityLabel: src.type === 'mp4' ? (src.qualities[0]?.label ?? '') : effectiveQuality, startAt, subtitle: subtitleFor(ref) });
+      const startAt = opts.startAt ?? resumePosition(mediaKey(ref), progressByKey.get(mediaKey(ref)));
+      const labels = src.qualities.map((q) => q.label);
+      const qualityLabel = urlQualities(src) ? (labels.includes(quality) ? quality : (labels[0] ?? '')) : effectiveQuality;
+      setPlaying({
+        media: ref,
+        sources: list,
+        providers: res.providers,
+        providerId: res.providerId,
+        failed: opts.failed ?? [],
+        sourceId: src.id,
+        qualityLabel,
+        startAt,
+        subtitle: subtitleFor(ref),
+      });
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [pickSource, progressByKey, effectiveQuality, episodes],
+    [pickSource, progressByKey, effectiveQuality, quality, episodes],
+  );
+
+  /** Ручной выбор источника в плеере: продолжаем с той же секунды. */
+  const switchProvider = useCallback(
+    async (id: string, position: number) => {
+      if (!playing) return;
+      const res = await api.sources(playing.media, { provider: id }).catch(() => null);
+      if (!res?.sources.length || res.providerId !== id) {
+        setPlaying((p) => (p && res ? { ...p, providers: res.providers } : p));
+        return;
+      }
+      play(playing.media, res, { startAt: position, failed: playing.failed });
+    },
+    [playing, play],
+  );
+
+  /** Поток упал окончательно: автоматически берём следующий провайдер из цепочки. */
+  const failover = useCallback(
+    async (position: number) => {
+      if (!playing) return;
+      const failed = [...new Set([...playing.failed, ...(playing.providerId ? [playing.providerId] : [])])];
+      const res = await api.sources(playing.media, { exclude: failed }).catch(() => null);
+      if (res?.sources.length) {
+        play(playing.media, res, { startAt: position, failed });
+        return;
+      }
+      setPlaying(null);
+      onPlayerState(null);
+      setNotice('Ни один источник не смог воспроизвести видео. Попробуйте позже.');
+    },
+    [playing, play, onPlayerState],
   );
 
   // Автозапуск по cast-у с телефона / кнопке «Смотреть» на главной.
@@ -302,15 +365,20 @@ export function TitleModal({ request, onClose, onPlayerState }: TitleModalProps)
     if (!request.autoplay || handledNonce.current === request.nonce) return;
     if (!sources || !currentRef || !titleProgress) return;
     handledNonce.current = request.nonce;
-    if (sources.length) play(currentRef, sources, { startAt: request.startAt, sourceId });
-  }, [request, sources, currentRef, titleProgress, sourceId, play]);
+    if (sources.length) play(currentRef, { sources, providers, providerId }, { startAt: request.startAt, sourceId });
+  }, [request, sources, providers, providerId, currentRef, titleProgress, sourceId, play]);
 
   const playEpisode = async (ep: Episode) => {
     setSeason(ep.season);
     setEpisode(ep.episode);
     const ref: MediaRef = { kind: 'tv', id: request.id, season: ep.season, episode: ep.episode };
-    const list = await api.sources(ref).catch(() => []);
-    if (list.length) play(ref, list);
+    const res = await api.sources(ref, { provider: preferredProvider }).catch(() => null);
+    if (res?.sources.length) play(ref, res);
+  };
+
+  const nextEpisodeInfo = (n: { season: number; episode: number } | null) => {
+    const ep = n && episodes.find((x) => x.season === n.season && x.episode === n.episode);
+    return ep ? { title: details?.title ?? '', subtitle: `Сезон ${ep.season}, серия ${ep.episode}${ep.name ? ` · ${ep.name}` : ''}`, stillUrl: ep.stillUrl } : undefined;
   };
 
   const nextEpisode = useMemo(() => {
@@ -415,13 +483,13 @@ export function TitleModal({ request, onClose, onPlayerState }: TitleModalProps)
                       </FocusButton>
                     ) : (
                       <>
-                        <FocusButton id="modal:play" variant="primary" autoFocus onEnter={() => currentRef && play(currentRef, sources, { startAt: resumable, sourceId })}>
+                        <FocusButton id="modal:play" variant="primary" autoFocus onEnter={() => currentRef && play(currentRef, { sources, providers, providerId }, { startAt: resumable, sourceId })}>
                           <Play className="size-[1.8rem] fill-current" />
                           {resumable ? `Смотреть с ${formatTime(resumable)}` : 'Смотреть'}
                           {isTv && season !== null && episode !== null && <span className="font-normal opacity-60">S{season}E{episode}</span>}
                         </FocusButton>
                         {resumable > 0 && (
-                          <FocusButton id="modal:restart" onEnter={() => currentRef && play(currentRef, sources, { startAt: 0, sourceId })}>
+                          <FocusButton id="modal:restart" onEnter={() => currentRef && play(currentRef, { sources, providers, providerId }, { startAt: 0, sourceId })}>
                             <RotateCcw className="size-[1.8rem]" /> Смотреть заново
                           </FocusButton>
                         )}
@@ -439,7 +507,29 @@ export function TitleModal({ request, onClose, onPlayerState }: TitleModalProps)
                     </FocusButton>
                   </FocusSection>
 
-                  {/* Озвучка и качество */}
+                  {notice && <div className="rounded-2xl bg-amber-500/15 px-6 py-3 text-[1.35rem] text-amber-100">{notice}</div>}
+
+                  {/* Источник, озвучка и качество */}
+                  {providers.length > 1 && (
+                    <FocusSection id="modal:providers" className="flex flex-wrap items-center gap-3">
+                      <span className="w-[11rem] text-[1.3rem] text-muted">Источник</span>
+                      {providers.map((p, i) => (
+                        <FocusButton
+                          key={p.id}
+                          variant="chip"
+                          selected={p.id === providerId}
+                          disabled={p.status === 'empty'}
+                          onEnter={() => {
+                            setNotice(null);
+                            setPreferredProvider(p.id);
+                          }}
+                        >
+                          {i + 1} · {p.name}
+                          {(p.status === 'error' || p.status === 'timeout') && <span className="opacity-60">· недоступен</span>}
+                        </FocusButton>
+                      ))}
+                    </FocusSection>
+                  )}
                   {sources && sources.length > 0 && (
                     <div className="space-y-4">
                       <FocusSection id="modal:voices" className="flex flex-wrap items-center gap-3">
@@ -544,6 +634,11 @@ export function TitleModal({ request, onClose, onPlayerState }: TitleModalProps)
           startAt={playing.startAt}
           onClose={closePlayer}
           onState={onPlayerState}
+          providers={playing.providers}
+          providerId={playing.providerId}
+          onSwitchProvider={(id, pos) => void switchProvider(id, pos)}
+          onSourceFailed={(pos) => void failover(pos)}
+          next={nextEpisodeInfo(nextEpisode)}
           onNext={
             nextEpisode
               ? () => {

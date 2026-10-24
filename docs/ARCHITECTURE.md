@@ -120,20 +120,52 @@ origin — нет CORS-проблем, нет чужого JS на страни�
 поэтому всплывающие окна, редиректы и майнеры технически не могут выполниться.
 Вложенные iframe проходятся только для того же хоста или хостов из `EXTRACTOR_ALLOWED_HOSTS`.
 
-### Провайдеры потоков
+### Провайдеры потоков и цепочка фоллбеков
 
 ```ts
 interface StreamProvider {
   id: string;
   name: string;
-  resolve(media: MediaRef): Promise<RawSource[]>; // озвучка × качества × upstream URL
+  resolveMedia(params: ResolveParams, signal?: AbortSignal): Promise<ProviderStream[] | null>;
 }
+// ResolveParams: kind, tmdbId, imdbId?, title?, originalTitle?, year?, season?, episode?
+// ProviderStream: url (m3u8/mp4), type, quality?, label? (озвучка), referer?
 ```
 
-Встроены `LibraryProvider` (ваша медиатека в `data/library.json`: NAS, Jellyfin/Plex direct-play,
-лицензированные потоки, страницы плееров, к которым у вас есть доступ) и `DemoProvider`
-(открытые фильмы Blender). Новый источник = класс с этим интерфейсом + регистрация в `src/index.ts`.
-Адаптеры под обход защиты конкретных пиратских балансеров в репозиторий намеренно не входят.
+`ProviderManager.resolveWithFallback(params, { preferred?, exclude? })`
+(`streaming/provider-manager.ts`):
+
+1. Провайдеры опрашиваются **последовательно** в порядке приоритета (`preferred` — первым).
+2. `null`/`[]` → статус `empty`, исключение → `error`, нет ответа за `timeoutMs` → `timeout`; переходим к следующему.
+3. Первый, вернувший потоки, — `ok`; остальные остаются `untried` (их не дёргаем зря).
+4. Ответы фильтруются (только `http(s)` + `hls`/`mp4`) и кэшируются: найденное — 10 мин, «нет» — 1 мин, ошибки не кэшируются.
+
+`/api/sources` группирует потоки активного провайдера в источники «озвучка × качества» и
+возвращает статусы всех провайдеров для переключателя. Если поток упал уже в плеере
+(манифест не грузится, сеть/декодер не восстановились), клиент повторяет запрос с
+`exclude=<упавшие>` и продолжает с той же секунды на следующем провайдере.
+
+| Провайдер | Файл | Сопоставление |
+|---|---|---|
+| `LibraryProvider` | `providers/library.ts` | `library.json`, ключ `movie:<tmdbId>` / `tv:<id>:sXeY` |
+| `JellyfinProvider` | `providers/jellyfin.ts` | индекс библиотеки по `ProviderIds.Tmdb/Imdb` (кэш 10 мин) → название + год ±1; серия — `/Shows/{id}/Episodes?season=` |
+| `GenericHttpProvider` | `providers/generic-http.ts` | шаблон URL, JSON `{streams:[…]}` или настраиваемый путь/поля; 404 = «нет тайтла» |
+| `DemoProvider` | `providers/demo.ts` | открытые фильмы Blender |
+
+Конфигурация — `data/providers.json`, сборка цепочки — `providers/registry.ts`. Адаптеры
+под обход защиты конкретных пиратских балансеров в репозиторий намеренно не входят.
+
+## Плеер: таймкоды, автопереход, громкость
+
+- **`usePlaybackSync`** (`hooks/usePlaybackSync.ts`): `timeupdate` → `localStorage` не чаще раза в 5 с
+  (`{position, duration, updatedAt, dirty: true}`); сервер — раз в 10 с во время просмотра и сразу на
+  `pause`/`ended`/`seeked`/выходе; `pagehide`/`beforeunload` — `sendBeacon`. Успешный ответ снимает `dirty`.
+  Неотправленные записи досылает `flushDirtyPlayback()` при старте приложения и на событии `online`,
+  не перетирая более свежий прогресс с сервера. «Смотреть с MM:SS» берёт свежайшую из двух копий.
+- **`AutoNextOverlay`**: по `ended` (если есть следующая серия) — размытый фон, кадр серии, кольцевой
+  отсчёт 8 с; Enter/Play — сразу, Back — отмена (фокус переходит на «Следующая серия» в панели).
+- **`VolumeHUD`**: ↑/↓ при скрытой панели — громкость ±5 %, индикатор исчезает через 2 с;
+  громкость с телефона тоже его показывает. Space (код 32) — пауза.
 
 ## Пространственная навигация
 

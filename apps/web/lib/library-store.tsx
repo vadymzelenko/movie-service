@@ -3,6 +3,7 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react';
 import { titleKey, type ListEntry, type ListName, type ProgressEntry, type TitleSummary } from '@movie/shared';
 import { api } from './api';
+import { flushDirtyPlayback } from './playback-store';
 
 interface LibraryState {
   progress: Map<string, ProgressEntry>;
@@ -35,12 +36,19 @@ export function LibraryProvider({ children }: { children: ReactNode }) {
   }, []);
 
   useEffect(() => {
-    void refresh();
+    // Сначала досылаем таймкоды, записанные офлайн, затем читаем историю с сервера.
+    void flushDirtyPlayback().finally(() => void refresh());
+    const onOnline = () =>
+      void flushDirtyPlayback().then((n) => {
+        if (n > 0) void refresh();
+      });
+    window.addEventListener('online', onOnline);
     try {
       setHide(localStorage.getItem(HIDE_KEY) === '1');
     } catch {
       /* storage недоступен */
     }
+    return () => window.removeEventListener('online', onOnline);
   }, [refresh]);
 
   const setHideWatched = useCallback((v: boolean) => {
